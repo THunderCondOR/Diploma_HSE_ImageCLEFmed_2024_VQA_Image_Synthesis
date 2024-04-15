@@ -17,7 +17,6 @@ class ClefKandinsky3Dataset(Dataset):
                  csv_filename='prompt-gt.csv',
                  train=True,
                  load_to_ram=False,
-                 val_size = 0.025,
                  random_seed=2204):
         super().__init__()
         
@@ -27,36 +26,33 @@ class ClefKandinsky3Dataset(Dataset):
         self.tokenizer = tokenizer
         self.train = train
         self.resolution = resolution
-        
+
         self.prompts_info = pd.read_csv(self.path + f'/{csv_filename}', header=0, delimiter=';')
         
-        self.train_size = int(self.prompts_info.shape[0] * (1 - val_size))
-        train_indexes = self.random_state.choice(self.prompts_info.shape[0], size=self.train_size, replace=False)
-
+        self.prompts_info['original_index'] = self.prompts_info.index
+        indexes = self.prompts_info.groupby('Filename').apply(lambda x: x.sample(1, random_state=self.random_state)).sample(2000)['original_index'].to_numpy()
+        
         if train:
-            self.texts = self.prompts_info.iloc[train_indexes, 0].tolist()
-            self.prompts = tokenizer(
-                self.texts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-            )
-            self.image_files = self.prompts_info.iloc[train_indexes, 1].tolist()
-        else:
-            self.val_size = self.prompts_info.shape[0] - self.train_size
-            val_indexes = np.delete(np.arange(self.prompts_info.shape[0]), train_indexes)
-            self.texts = self.prompts_info.iloc[val_indexes, 0].tolist()
-            self.prompts = tokenizer(
-                self.texts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-            )
-            self.image_files = self.prompts_info.iloc[val_indexes, 1].tolist()
+            indexes = np.delete(np.arange(self.prompts_info.shape[0]), indexes)
+        
+        self.texts = self.prompts_info.iloc[indexes, 0].tolist()
+        self.prompts = tokenizer(
+            self.texts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        self.image_ids, self.image_files = pd.factorize(self.prompts_info.iloc[indexes, 1])
 
         if load_to_ram:
             self.images = self._load_images(self.image_files)
         
 
-    def _load_images(self, image_files):
+    def _load_images(self, image_files, desc='Loading images'):
         images = []
-        for filename in tqdm(image_files):
+        for filename in image_files:
             image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
-            images += [image]
+            transform = T.Compose([T.CenterCrop(min(image.size)),
+                                   T.Resize(self.resolution),
+                                   T.ToTensor()])
+            images += [transform(image)]
 
         return images
 
@@ -65,19 +61,21 @@ class ClefKandinsky3Dataset(Dataset):
 
     def __getitem__(self, item):
         if self.load_to_ram:
-            image = self.images[item]
+            image = self.images[self.image_ids[item]]
         else:
-            filename = self.image_files[item]
+            filename = self.image_files[self.image_ids[item]]
             image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
-        transform = T.Compose([T.CenterCrop(min(image.size)),
-                               T.Resize(size=(self.resolution, self.resolution), interpolation=InterpolationMode.BICUBIC),
-                               T.ToTensor()])
+            transform = T.Compose([T.RandomCrop(min(image.size)),
+                                   T.Resize(self.resolution),
+                                   T.ToTensor(),
+                                   T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+            image = transform(image)
         if self.train:
-            return {"pixel_values": transform(image) / 127.5 - 1,
+            return {"pixel_values": image,
                     "input_ids": self.prompts['input_ids'][item],
                     "attention_mask": self.prompts['attention_mask'][item].bool()}
         else:
-            return {"image": self.transform(image), "prompt": self.texts[item]}
+            return {"images": image, "prompts": self.texts[item]}
 
 
 class ClefKandinskyPriorDataset(Dataset):
@@ -85,11 +83,10 @@ class ClefKandinskyPriorDataset(Dataset):
                  path,
                  tokenizer,
                  image_processor,
-                 resolution=64,
                  csv_filename='prompt-gt.csv',
+                 resolution=64,
                  train=True,
-                 load_to_ram=False,
-                 val_size = 0.025,
+                 load_to_ram=True,
                  random_seed=2204):
         super().__init__()
         
@@ -99,28 +96,21 @@ class ClefKandinskyPriorDataset(Dataset):
         self.tokenizer = tokenizer
         self.image_processor = image_processor
         self.train = train
-        self.transform = T.Compose([T.Resize(size=(resolution, resolution)), T.ToTensor()])
-        
+        self.resolution = resolution
         
         self.prompts_info = pd.read_csv(self.path + f'/{csv_filename}', header=0, delimiter=';')
         
-        self.train_size = int(self.prompts_info.shape[0] * (1 - val_size))
-        train_indexes = self.random_state.choice(self.prompts_info.shape[0], size=self.train_size, replace=False)
-
+        self.prompts_info['original_index'] = self.prompts_info.index
+        indexes = self.prompts_info.groupby('Filename').apply(lambda x: x.sample(1, random_state=self.random_state)).sample(2000)['original_index'].to_numpy()
+        
         if train:
-            self.texts = self.prompts_info.iloc[train_indexes, 0].tolist()
-            self.prompts = tokenizer(
-                self.texts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-            )
-            self.image_files = self.prompts_info.iloc[train_indexes, 1].tolist()
-        else:
-            self.val_size = self.prompts_info.shape[0] - self.train_size
-            val_indexes = np.delete(np.arange(self.prompts_info.shape[0]), train_indexes)
-            self.texts = self.prompts_info.iloc[val_indexes, 0].tolist()
-            self.prompts = tokenizer(
-                self.texts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-            )
-            self.image_files = self.prompts_info.iloc[val_indexes, 1].tolist()
+            indexes = np.delete(np.arange(self.prompts_info.shape[0]), indexes)
+        
+        self.texts = self.prompts_info.iloc[indexes, 0].tolist()
+        self.prompts = tokenizer(
+            self.texts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        self.image_ids, self.image_files = pd.factorize(self.prompts_info.iloc[indexes, 1])
 
         if load_to_ram:
             self.images = self._load_images(self.image_files)
@@ -128,9 +118,15 @@ class ClefKandinskyPriorDataset(Dataset):
 
     def _load_images(self, image_files):
         images = []
-        for filename in tqdm(image_files):
+        for filename in image_files:
             image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
-            images += [image]
+            if self.train:
+                images += [self.image_processor(image, return_tensors="pt").pixel_values.squeeze(0)]
+            else:
+                transform = T.Compose([T.CenterCrop(min(image.size)),
+                                       T.Resize(self.resolution),
+                                       T.ToTensor()])
+                images += [transform(image)]
 
         return images
 
@@ -139,16 +135,24 @@ class ClefKandinskyPriorDataset(Dataset):
 
     def __getitem__(self, item):
         if self.load_to_ram:
-            image = self.images[item]
+            image = self.images[self.image_ids[item]]
         else:
-            filename = self.image_files[item]
+            filename = self.image_files[self.image_ids[item]]
             image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
+            if self.train:
+                image = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(0)
+            else:
+                transform = T.Compose([T.RandomCrop(min(image.size)),
+                                       T.Resize(self.resolution),
+                                       T.ToTensor(),
+                                       T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+                image = transform(image)
         if self.train:
-            return {"clip_pixel_values":  self.image_processor(image, return_tensors="pt").pixel_values.squeeze(0),
+            return {"clip_pixel_values": image,
                     "text_input_ids": self.prompts['input_ids'][item],
                     "text_mask": self.prompts['attention_mask'][item].bool()}
         else:
-            return {"image": self.transform(image), "prompt": self.texts[item]}
+            return {"images": image, "prompts": self.texts[item]}
 
 
 class ClefKandinskyDecoderDataset(Dataset):
@@ -159,7 +163,6 @@ class ClefKandinskyDecoderDataset(Dataset):
                  resolution=256,
                  train=True,
                  load_to_ram=False,
-                 val_size = 0.025,
                  random_seed=2204):
         super().__init__()
         
@@ -171,27 +174,28 @@ class ClefKandinskyDecoderDataset(Dataset):
         self.train = train
         
         self.prompts_info = pd.read_csv(self.path + f'/{csv_filename}', header=0, delimiter=';')
-        all_files_names = self.prompts_info['Filename'].unique()
+
+        self.image_files = self.prompts_info['Filename'].unique()
         
-        self.train_size = int(len(all_files_names) * (1 - val_size))
-        train_indexes = self.random_state.choice(len(all_files_names), size=self.train_size, replace=False)
-
-        if train:
-            self.image_files = all_files_names[train_indexes].tolist()
-        else:
-            self.val_size = len(all_files_names) - self.train_size
-            val_indexes = np.delete(np.arange(len(all_files_names)), train_indexes)
-            self.image_files = all_files_names[val_indexes].tolist()
-
+        if not train:
+            self.prompts_info['original_index'] = self.prompts_info.index
+            val_indexes = self.prompts_info.groupby('Filename').apply(lambda x: x.sample(1, random_state=self.random_state)).sample(2000)['original_index'].to_numpy()
+            self.texts = self.prompts_info.iloc[val_indexes, 0].tolist()
+            self.image_ids, self.image_files = pd.factorize(self.prompts_info.iloc[val_indexes, 1])
+        
         if load_to_ram:
             self.images = self._load_images(self.image_files)
         
 
     def _load_images(self, image_files):
         images = []
-        for filename in tqdm(image_files):
+        for filename in image_files:
             image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
-            images += [image]
+            transform = T.Compose([T.CenterCrop(min(image.size)),
+                                   T.Resize(self.resolution),
+                                   T.ToTensor(),
+                                   ])
+            images += [transform(image)]
 
         return images
 
@@ -199,38 +203,35 @@ class ClefKandinskyDecoderDataset(Dataset):
         return len(self.image_files)
 
     def __getitem__(self, item):
-        if self.load_to_ram:
-            image = self.images[item]
-        else:
+        if self.train:
             filename = self.image_files[item]
             image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
-        transform = T.Compose([T.CenterCrop(min(image.size)),
-                               T.Resize(size=(self.resolution, self.resolution), interpolation=InterpolationMode.BICUBIC),
-                               T.ToTensor()])
+            transform = T.Compose([T.RandomCrop(min(image.size)),
+                                    T.Resize(self.resolution),
+                                    T.ToTensor(),
+                                    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
         
-        if self.train:
-            return {"pixel_values": transform(image).to(torch.float32) / 127.5 - 1,
+            return {"pixel_values": transform(image).to(torch.float32),
                     "clip_pixel_values":  self.image_processor(image, return_tensors="pt").pixel_values.squeeze(0)}
         else:
-            return {"image": self.transform(image), "prompt": self.texts[item]}
+            return {"prompts": self.texts[item]}
 
 
 class MyFIDDataset(Dataset):
-    def __init__(self, data, tensors=True):
+    def __init__(self, data, fake=False):
         super().__init__()
+        self.fake = fake
+        self.to_tensor = T.ToTensor()
+        self.data = data
+        if fake:
+            tensor_data = []
+            for img in data:
+                tensor_data += [self.to_tensor(img)]
+            self.data = torch.stack(tensor_data)
         
-        self.tensors = tensors
-        self.transform = T.Compose([T.Resize(size=(64, 64)), T.ToTensor()])
-        if tensors:
-            self.data = torch.cat(data, dim=0)
-        else:
-            self.data = data
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, item):
-        if self.tensors:
-            return {'images': self.data[item]}
-        else:
-            return {'images': self.transform(self.data[item])}
+        return {'images': self.data[item]}

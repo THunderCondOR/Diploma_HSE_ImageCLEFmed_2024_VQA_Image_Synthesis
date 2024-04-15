@@ -2,19 +2,23 @@ import argparse
 import math
 import wandb
 import numpy as np
+import os
 
 import torch
 import torch.nn.functional as F
+from torchmetrics.image.fid import FrechetInceptionDistance
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from diffusers import AutoPipelineForText2Image, DDPMScheduler, PriorTransformer
+from diffusers import AutoPipelineForText2Image, DDPMScheduler, PriorTransformer, StableDiffusionPipeline
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
+from diffusers.utils import convert_state_dict_to_diffusers
+from diffusers.training_utils import compute_snr
 from tqdm import tqdm
-from piq import FID
+from piq import FID, ssim
 from PIL import Image
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from peft import get_peft_model
 from peft.utils import get_peft_model_state_dict
 from transformers import (CLIPImageProcessor, CLIPTextModelWithProjection,
@@ -60,7 +64,7 @@ def image_grid(imgs, rows, cols):
     assert len(imgs) == rows*cols
 
     w, h = imgs[0].size
-    grid = Image.new('RGB', size=(cols*w, rows*h))
+    grid = Image.new('RGB', size=(cols * w, rows * h))
     grid_w, grid_h = grid.size
     
     for i, img in enumerate(imgs):
@@ -72,7 +76,7 @@ def main():
     args = parse_args()
     cfg = get_cfg_defaults()
     if args.config_path:
-        cfg.merge_from_file(args.config_path)
+        cfg.merge_from_file(cfg['SYSTEM']['CONFIG_PATH'] + args.config_path)
     cfg.freeze()
 
     accelerator = Accelerator(
@@ -81,13 +85,14 @@ def main():
         log_with=cfg['ACCELERATOR']['LOG_WITH'],
     )
     set_seed(cfg['SYSTEM']['RANDOM_SEED'])
+    np.random.seed(cfg['SYSTEM']['RANDOM_SEED'])
 
-    noise_scheduler = DDPMScheduler.from_pretrained(cfg['EXPERIMENT']['DECODER_PATH'], subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="tokenizer")
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'],  subfolder="image_encoder")
-    image_processor = CLIPImageProcessor.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'],  subfolder="image_processor")
-    text_encoder = CLIPTextModelWithProjection.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="text_encoder")
-    prior = PriorTransformer.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="prior")
+    noise_scheduler = DDPMScheduler.from_pretrained(cfg['EXPERIMENT']['DECODER_PATH'], subfolder="scheduler", local_files_only=True)
+    tokenizer = CLIPTokenizer.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="tokenizer", local_files_only=True)
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="image_encoder", local_files_only=True)
+    image_processor = CLIPImageProcessor.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'],  subfolder="image_processor", local_files_only=True)
+    text_encoder = CLIPTextModelWithProjection.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="text_encoder", local_files_only=True)
+    prior = PriorTransformer.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="prior", local_files_only=True)
 
     image_encoder.requires_grad_(False)
     prior.requires_grad_(False)
@@ -108,9 +113,17 @@ def main():
         lora_alpha=cfg['LORA']['ALPHA'],
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        use_dora=cfg['LORA']['USE_DORA'],
+        use_rslora=cfg['LORA']['USE_RSLORA']
     )
 
-    prior.add_adapter(prior_lora_config)
+    prior = get_peft_model(prior, prior_lora_config)
+    prior.print_trainable_parameters()
+
+    for p in prior.parameters():
+        if p.requires_grad:
+            p.data = p.to(torch.float32)
+
     lora_layers = filter(lambda p: p.requires_grad, prior.parameters())
 
     optimizer_cls = torch.optim.AdamW
@@ -123,7 +136,19 @@ def main():
         eps=cfg['OPTIMIZER']['ADAM_EPSILON']
     )
 
-    train_dataset = ClefKandinskyPriorDataset(cfg['EXPERIMENT']['DATASET_TRAIN_PATH'], tokenizer, image_processor, cfg['EXPERIMENT']['PROMPTS_FILE_NAME'])
+    train_dataset = ClefKandinskyPriorDataset(cfg['EXPERIMENT']['DATASET_TRAIN_PATH'],
+                                              tokenizer,
+                                              image_processor,
+                                              csv_filename=cfg['EXPERIMENT']['PROMPTS_FILE_NAME'],
+                                              resolution=cfg['TRAIN']['IMAGE_RESOLUTION'],
+                                              load_to_ram=False)
+    val_dataset = ClefKandinskyPriorDataset(cfg['EXPERIMENT']['DATASET_TRAIN_PATH'],
+                                            tokenizer,
+                                            image_processor,
+                                            csv_filename=cfg['EXPERIMENT']['PROMPTS_FILE_NAME'],
+                                            resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'],
+                                            train=False,
+                                            load_to_ram=True)
 
     def collate_fn(examples):
         clip_pixel_values = torch.stack([example["clip_pixel_values"] for example in examples])
@@ -137,12 +162,22 @@ def main():
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=cfg['TRAIN']['BATCH_SIZE'],
-        num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS']
+        num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS'],
+        pin_memory=True
+    )
+
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        shuffle=False,
+        batch_size=cfg['TRAIN']['VAL_BATCH_SIZE'],
+        num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS'],
     )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / cfg['ACCELERATOR']['ACCUMULATION_STEPS'])
-    max_train_steps = cfg['TRAIN']['EPOCHS'] * num_update_steps_per_epoch
-
+    if cfg['TRAIN']['MAX_TRAIN_STEPS'] == -1:
+        max_train_steps = cfg['TRAIN']['EPOCHS'] * num_update_steps_per_epoch
+    else:
+        max_train_steps = cfg['TRAIN']['MAX_TRAIN_STEPS']
     lr_scheduler = get_scheduler(
             name=cfg['SCHEDULER']['NAME'],
             optimizer=optimizer,
@@ -212,8 +247,24 @@ def main():
                     encoder_hidden_states=text_encoder_hidden_states,
                     attention_mask=text_mask,
                 ).predicted_image_embedding
-                # model_pred.requires_grad = True
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                
+                if cfg['SCHEDULER']['SNR_GAMMA'] == -1:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                else:
+                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                    # This is discussed in Section 4.2 of the same paper.
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    if noise_scheduler.config.prediction_type == "v_prediction":
+                        # Velocity objective requires that we add one to SNR values before we divide by them.
+                        snr = snr + 1
+                    mse_loss_weights = (
+                        torch.stack([snr, cfg['SCHEDULER']['SNR_GAMMA'] * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                    )
+
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    loss = loss.mean()
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(cfg['TRAIN']['BATCH_SIZE'])).mean()
@@ -230,44 +281,97 @@ def main():
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
-                global_step += 1
                 accelerator.log({"prior_train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
+
+                if accelerator.is_main_process:
+                    if (global_step) % cfg['TRAIN']['IMAGE_VALIDATION_STEPS'] == 0 or global_step + 1 == max_train_steps:
+                        try:
+                            pipeline = AutoPipelineForText2Image.from_pretrained(
+                                cfg['EXPERIMENT']['DECODER_PATH'],
+                                prior_prior=accelerator.unwrap_model(prior),
+                                prior_text_encoder=text_encoder,
+                                prior_image_encoder=image_encoder,
+                                prior_image_processor=image_processor,
+                                prior_tokenizer=tokenizer,
+                                torch_dtype=weight_dtype,
+                                local_files_only=True
+                            )
+                            pipeline.unet = PeftModel.from_pretrained(pipeline.unet, cfg['EXPERIMENT']['LORA_DECODER_WEIGHTS_OUTPUT_DIR'], subfolder='unet')
+                            pipeline = pipeline.to(accelerator.device)
+                            pipeline.set_progress_bar_config(disable=True)
+                            generator = torch.Generator(device=accelerator.device)
+                            generator = generator.manual_seed(cfg['SYSTEM']['RANDOM_SEED'])
+
+                            val_images = pipeline(cfg['EXPERIMENT']['VALIDATION_PROMPT'], num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'], num_images_per_prompt=4, generator=generator).images
+                            log_dict = {"Prior validation": wandb.Image(image_grid(val_images, 2, 2), caption=cfg['EXPERIMENT']['VALIDATION_PROMPT'])}
+
+                            if cfg['EXPERIMENT']['FID_VALIDATION'] and (global_step % cfg['TRAIN']['FID_VALIDATION_STEPS'] == 0 or global_step + 1 == max_train_steps):
+                                fake_images = []
+                                for val_batch in tqdm(val_dataloader):
+                                    fake_images += pipeline(val_batch['prompts'], num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'], height=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], width=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], generator=generator).images
+
+                                del pipeline
+
+                                real_images = torch.stack(val_dataset.images)
+
+                                real_dataset = MyFIDDataset(real_images)
+                                fake_dataset = MyFIDDataset(fake_images, fake=True)
+
+                                ssim_value = ssim(fake_dataset.data, real_images, data_range=1.)
+                                fid_metric = FID()
+
+                                real_loader = torch.utils.data.DataLoader(real_dataset, batch_size=100)
+                                fake_loader = torch.utils.data.DataLoader(fake_dataset, batch_size=100)
+                                
+                                real_feats = fid_metric.compute_feats(real_loader, device=accelerator.device)
+                                fake_feats = fid_metric.compute_feats(fake_loader, device=accelerator.device)
+                                
+                                fid_value = fid_metric(real_feats, fake_feats).item()
+
+                                #-----------------------------------------------------------
+                                fake_images = fake_dataset.data.to(accelerator.device)
+                                real_images = real_images.to(accelerator.device)
+                                torchmetrics_fid = FrechetInceptionDistance(normalize=True)
+                                torchmetrics_fid.to(accelerator.device)
+                                torchmetrics_fid.update(real_images, real=True)
+                                torchmetrics_fid.update(fake_images, real=False)
+
+                                log_dict['Torchmetrics_FID'] = float(torchmetrics_fid.compute())
+                                del torchmetrics_fid
+                                #-----------------------------------------------------------
+
+                                log_dict['FID'] = fid_value
+                                log_dict['SSIM'] = ssim_value
+                                
+                                del fid_metric
+                            else:
+                                del pipeline
+                            
+                            for tracker in accelerator.trackers:
+                                    if tracker.name == "wandb":
+                                        tracker.log(log_dict)
+
+                        except ConnectionError as error:
+                            print('Unable to Validate: Connection Error')
+                        torch.cuda.empty_cache()
+
+                global_step += 1
+
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
-
+            
             if global_step >= max_train_steps:
-                    break
-
-        if accelerator.is_main_process:
-            if (epoch + 1) % cfg['TRAIN']['VALIDATION_EPOCHS'] == 0 or epoch == cfg['TRAIN']['EPOCHS'] - 1:
-                try:
-                    pipeline = AutoPipelineForText2Image.from_pretrained(
-                        cfg['EXPERIMENT']['DECODER_PATH'],
-                        prior_prior=accelerator.unwrap_model(prior),
-                        torch_dtype=weight_dtype,
-                        local_files_only=True
-                    )
-                    pipeline = pipeline.to(accelerator.device)
-                    pipeline.set_progress_bar_config(disable=True)
-                    generator = torch.Generator(device=accelerator.device)
-                    generator = generator.manual_seed(cfg['SYSTEM']['RANDOM_SEED'])
-
-                    image = pipeline(cfg['EXPERIMENT']['VALIDATION_PROMPT'], num_inference_steps=30, generator=generator).images[0]
-                    for tracker in accelerator.trackers:
-                        if tracker.name == "wandb":
-                            tracker.log({"Prior validation": wandb.Image(image, caption=cfg['EXPERIMENT']['VALIDATION_PROMPT'])})
-
-                    del pipeline
-                except ConnectionError as error:
-                    print('Unable to Validate: Connection Error')
-                torch.cuda.empty_cache()
+                break
 
 
     accelerator.wait_for_everyone()
-    # if accelerator.is_main_process:
-    #     prior = prior.to(torch.float32)
-    #     prior.save_attn_procs(cfg['EXPERIMENT']['LORA_PRIOR_WEIGHTS_OUTPUT_DIR'])
+    if accelerator.is_main_process:
+        unwrapped_prior = accelerator.unwrap_model(prior)
+        unwrapped_prior.save_pretrained(
+                os.path.join(cfg['EXPERIMENT']['LORA_PRIOR_WEIGHTS_OUTPUT_DIR'], cfg['EXPERIMENT']['LORA_PRIOR_SUBFOLDER']),
+                safe_serialization=False
+        )
     accelerator.end_training()
 
 

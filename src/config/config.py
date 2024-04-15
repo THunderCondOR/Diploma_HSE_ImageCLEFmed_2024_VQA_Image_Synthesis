@@ -21,6 +21,8 @@ _C.LORA.RANK = 128
 _C.LORA.ALPHA = 128
 _C.LORA.HIDDEN_SIZE = 2048
 _C.LORA.MAX_GRADIENT_NORM = 1
+_C.LORA.USE_DORA = False
+_C.LORA.USE_RSLORA = False
 
 _C.SCHEDULER = CN()
 _C.SCHEDULER.NAME = 'constant'
@@ -35,24 +37,33 @@ _C.SYSTEM.RANDOM_SEED = 2204
 _C.SYSTEM.CONFIG_PATH = '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/src/config/experiments/'
 
 _C.TRAIN = CN()
-_C.TRAIN.EPOCHS = 2
+_C.TRAIN.EPOCHS = 10
 _C.TRAIN.VALIDATION_EPOCHS = 1
+_C.TRAIN.IMAGE_VALIDATION_STEPS = 50
+_C.TRAIN.FID_VALIDATION_STEPS = 50
 _C.TRAIN.DATALOADER_NUM_WORKERS = 2
-_C.TRAIN.BATCH_SIZE = 64
+_C.TRAIN.BATCH_SIZE = 8
+_C.TRAIN.VAL_BATCH_SIZE = 50
 _C.TRAIN.IMAGE_RESOLUTION = 512
+_C.TRAIN.VAL_IMAGE_RESOLUTION = 256
+_C.TRAIN.NUM_INFERENCE_STEPS = 30
+_C.TRAIN.MAX_TRAIN_STEPS = -1
 
 _C.EXPERIMENT = CN()
 _C.EXPERIMENT.PROJECT_NAME = 'Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis'
-_C.EXPERIMENT.NAME = 'Prior_Experiment_1'
+_C.EXPERIMENT.NAME = 'Decoder_Experiment_2'
 _C.EXPERIMENT.LORA_PRIOR_WEIGHTS_OUTPUT_DIR = '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/lora_weights_prior'
+_C.EXPERIMENT.LORA_PRIOR_SUBFOLDER = 'prior'
 _C.EXPERIMENT.LORA_DECODER_WEIGHTS_OUTPUT_DIR = '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/lora_weights_decoder'
+_C.EXPERIMENT.LORA_DECODER_SUBFOLDER = 'unet'
 _C.EXPERIMENT.KANDINSKY3_LORA_WEIGHTS_OUTPUT_DIR = '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/kandinky3_lora_weights'
 _C.EXPERIMENT.DATASET_TRAIN_PATH = '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/data/train'
 _C.EXPERIMENT.PROMPTS_FILE_NAME = 'prompt-gt.csv'
-_C.EXPERIMENT.DECODER_PATH = '/home/mvchaychuk/kandinsky-2-2-decoder'
-_C.EXPERIMENT.PRIOR_PATH = '/home/mvchaychuk/kandinsky-2-2-prior'
+_C.EXPERIMENT.DECODER_PATH = 'kandinsky-community/kandinsky-2-2-decoder'
+_C.EXPERIMENT.PRIOR_PATH = 'kandinsky-community/kandinsky-2-2-prior'
 _C.EXPERIMENT.KANDINSKY3_PATH = '/home/mvchaychuk/kandinsky-3'
 _C.EXPERIMENT.VALIDATION_PROMPT = "generate an image containing a polyp"
+_C.EXPERIMENT.FID_VALIDATION = True
 
 def get_cfg_defaults():
   """Get a yacs CfgNode object with default values for my_project."""
