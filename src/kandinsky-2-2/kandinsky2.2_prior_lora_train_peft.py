@@ -88,10 +88,10 @@ def main():
     np.random.seed(cfg['SYSTEM']['RANDOM_SEED'])
 
     noise_scheduler = DDPMScheduler.from_pretrained(cfg['EXPERIMENT']['DECODER_PATH'], subfolder="scheduler", local_files_only=True)
-    tokenizer = CLIPTokenizer.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="tokenizer", local_files_only=True)
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="image_encoder", local_files_only=True)
     image_processor = CLIPImageProcessor.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'],  subfolder="image_processor", local_files_only=True)
     text_encoder = CLIPTextModelWithProjection.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="text_encoder", local_files_only=True)
+    tokenizer = CLIPTokenizer.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="tokenizer", local_files_only=True)
     prior = PriorTransformer.from_pretrained(cfg['EXPERIMENT']['PRIOR_PATH'], subfolder="prior", local_files_only=True)
 
     image_encoder.requires_grad_(False)
@@ -211,6 +211,20 @@ def main():
         disable=not accelerator.is_local_main_process
     )
 
+    val_texts = ['Generate an image with 1 finding.',
+                                         'Generate an image containing text.',
+                                         'Generate an image with an abnormality with the colors pink, red and white.',
+                                         'Generate an image not containing a green/black box artefact.',
+                                         'Generate an image containing a polyp.',
+                                         'Generate an image containing a green/black box artefact.',
+                                         'Generate an image with no polyps.',
+                                         'Generate an image with an an instrument located in the lower-right and lower-center.',
+                                         'Generate an image containing a green/black box artefact.']
+    polyp_text = ['generate an image containing a polyp']
+
+    val_epoch_loss = 0.0
+    val_epoch_batch_sum = 0.0
+
     for epoch in range(first_epoch, cfg['TRAIN']['EPOCHS']):
         prior.train()
         train_loss = 0.0
@@ -270,6 +284,9 @@ def main():
                 avg_loss = accelerator.gather(loss.repeat(cfg['TRAIN']['BATCH_SIZE'])).mean()
                 train_loss += avg_loss.item() / cfg['ACCELERATOR']['ACCUMULATION_STEPS']
 
+                val_epoch_loss += train_loss * batch["text_input_ids"].shape[0]
+                val_epoch_batch_sum += batch["text_input_ids"].shape[0]
+
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -281,7 +298,7 @@ def main():
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
-                accelerator.log({"prior_train_loss": train_loss}, step=global_step)
+                accelerator.log({"prior_train_step_loss": train_loss}, step=global_step)
                 train_loss = 0.0
 
                 if accelerator.is_main_process:
@@ -297,14 +314,22 @@ def main():
                                 torch_dtype=weight_dtype,
                                 local_files_only=True
                             )
-                            pipeline.unet = PeftModel.from_pretrained(pipeline.unet, cfg['EXPERIMENT']['LORA_DECODER_WEIGHTS_OUTPUT_DIR'], subfolder='unet')
+                            pipeline.unet = PeftModel.from_pretrained(pipeline.unet, cfg['EXPERIMENT']['LORA_DECODER_WEIGHTS_OUTPUT_DIR'], subfolder='unet_2')
                             pipeline = pipeline.to(accelerator.device)
                             pipeline.set_progress_bar_config(disable=True)
                             generator = torch.Generator(device=accelerator.device)
                             generator = generator.manual_seed(cfg['SYSTEM']['RANDOM_SEED'])
 
-                            val_images = pipeline(cfg['EXPERIMENT']['VALIDATION_PROMPT'], num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'], num_images_per_prompt=4, generator=generator).images
-                            log_dict = {"Prior validation": wandb.Image(image_grid(val_images, 2, 2), caption=cfg['EXPERIMENT']['VALIDATION_PROMPT'])}
+                            val_images = pipeline(val_texts, num_inference_steps=100, height=256, width=256, generator=generator).images
+                            
+                            polyp_images = pipeline(polyp_text, num_inference_steps=100, height=256, width=256, num_images_per_prompt=4, generator=generator).images
+                            
+                            log_dict = {"Medfusion Unet validation": wandb.Image(image_grid(val_images, 3, 3), caption=';'.join(val_texts)),
+                                        "Polyp Validation": wandb.Image(image_grid(polyp_images, 2, 2), caption='generate an image containing a polyp'),
+                                        "Val Epoch Loss:": val_epoch_loss / val_epoch_batch_sum}
+                            
+                            val_epoch_loss = 0.0
+                            val_epoch_batch_sum = 0.0
 
                             if cfg['EXPERIMENT']['FID_VALIDATION'] and (global_step % cfg['TRAIN']['FID_VALIDATION_STEPS'] == 0 or global_step + 1 == max_train_steps):
                                 fake_images = []

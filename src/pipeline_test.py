@@ -21,29 +21,29 @@ def image_grid(imgs, rows, cols):
 
 # prior_ = None
 
-print('fp_16 + 299 + inf 50')
+print('fp_16 + 256 + inf 200')
 
 pipeline = AutoPipelineForText2Image.from_pretrained("kandinsky-community/kandinsky-2-2-decoder", local_files_only=True, torch_dtype=torch.float16)
-pipeline.prior_prior = PeftModel.from_pretrained(pipeline.prior_prior, '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/lora_weights_prior', subfolder='prior_rank16_2')
-pipeline.unet = PeftModel.from_pretrained(pipeline.unet, '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/lora_weights_decoder', subfolder='unet')
+pipeline.prior_prior = PeftModel.from_pretrained(pipeline.prior_prior, '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/trained_lora_weights/lora_weights_prior', subfolder='prior_rank16_2')
+pipeline.unet = PeftModel.from_pretrained(pipeline.unet, '/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/trained_lora_weights/lora_weights_decoder', subfolder='unet')
 pipeline = pipeline.to('cuda')
 pipeline.set_progress_bar_config(disable=True)
 generator = torch.Generator(device='cuda')
 generator = generator.manual_seed(49275923)
 
 
-val_dataset = ClefKandinskyDecoderDataset('/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/data/train', image_processor=None, resolution=512, train=False, load_to_ram=True)
+val_dataset = ClefKandinskyDecoderDataset('/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/data/train', image_processor=None, resolution=256, train=False, load_to_ram=True)
 
 val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
         shuffle=False,
-        batch_size=40,
+        batch_size=100,
         num_workers=2,
 )
 
 fake_images = []
 for val_batch in tqdm(val_dataloader):
-    fake_images += pipeline(val_batch['prompts'], num_inference_steps=100, height=512, width=512, generator=generator).images
+    fake_images += pipeline(val_batch['prompts'], num_inference_steps=100, height=256, width=256, generator=generator).images
 
 grid = image_grid(fake_images[:9], 3, 3)
 grid.save('pipeline_test_image_grid_256.jpg')

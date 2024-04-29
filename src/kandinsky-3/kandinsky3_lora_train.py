@@ -18,6 +18,7 @@ from peft import get_peft_model
 from peft.utils import get_peft_model_state_dict
 from tqdm import tqdm
 from piq import FID, ssim
+from torchmetrics.image.fid import FrechetInceptionDistance
 from PIL import Image
 from transformers import T5EncoderModel, T5Tokenizer
 from requests.exceptions import ConnectionError
@@ -89,7 +90,6 @@ def main():
     movq = VQModel.from_pretrained(cfg['EXPERIMENT']['KANDINSKY3_PATH'], subfolder="movq", use_safetensors=True, variant="fp16", local_files_only=True)
     tokenizer = T5Tokenizer.from_pretrained(cfg['EXPERIMENT']['KANDINSKY3_PATH'], subfolder="tokenizer", local_files_only=True)
     unet = Kandinsky3UNet.from_pretrained(cfg['EXPERIMENT']['KANDINSKY3_PATH'], subfolder="unet", use_safetensors=True, variant="fp16", local_files_only=True)
-    
     unet.requires_grad_(False)
     movq.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -111,12 +111,16 @@ def main():
     )
 
     unet.to(accelerator.device, dtype=weight_dtype)
-    movq.to(accelerator.device, dtype=weight_dtype)
+    movq.to(accelerator.device, dtype=torch.float32)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     #unet.add_adapter(unet_lora_config)
     unet = get_peft_model(unet, unet_lora_config)
     unet.print_trainable_parameters()
+
+    for p in unet.parameters():
+        if p.requires_grad:
+            p.data = p.to(torch.float32)
     
     lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
 
@@ -192,13 +196,14 @@ def main():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 with torch.no_grad():
-                    latents = movq.encode(batch["pixel_values"].to(dtype=weight_dtype)).latents # * movq.config.scaling_factor
+                    latents = movq.encode(batch["pixel_values"].to(dtype=torch.float32)).latents # * movq.config.scaling_factor
 
                     noise = torch.randn_like(latents)
 
                     bsz = latents.shape[0]
                     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                     timesteps = timesteps.long()
+                    print(timesteps.shape)
 
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                     encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
@@ -248,11 +253,12 @@ def main():
                 progress_bar.update(1)
                 accelerator.log({"kandinsky3_train_loss": train_loss}, step=global_step)
                 if accelerator.is_main_process:
-                    if (global_step) % cfg['TRAIN']['IMAGE_VALIDATION_STEPS'] == 0 or global_step == max_train_steps:
+                    if (global_step) % cfg['TRAIN']['IMAGE_VALIDATION_STEPS'] == 0 or global_step + 1 == max_train_steps:
                         try:
-                            pipeline = DiffusionPipeline.from_pretrained(
+                            pipeline = Kandinsky3Pipeline.from_pretrained(
                                 cfg['EXPERIMENT']['KANDINSKY3_PATH'],
                                 unet=accelerator.unwrap_model(unet),
+                                scheduler=accelerator.unwrap_model(noise_scheduler),
                                 tokenizer=tokenizer,
                                 text_encoder=text_encoder,
                                 movq=movq,
@@ -269,25 +275,15 @@ def main():
                             pipeline.to(accelerator.device)
                             generator = torch.Generator(device=accelerator.device)
 
-                            val_images = pipeline(cfg['EXPERIMENT']['VALIDATION_PROMPT'], num_inference_steps=100, num_images_per_prompt=4, height=256, width=256, generator=generator).images
+                            val_images = pipeline(cfg['EXPERIMENT']['VALIDATION_PROMPT'], num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'], height=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], width=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], num_images_per_prompt=4, generator=generator).images
                             log_dict = {"Kandinsky-3 validation": wandb.Image(image_grid(val_images, 2, 2), caption=cfg['EXPERIMENT']['VALIDATION_PROMPT'])}
 
-                            if cfg['EXPERIMENT']['FID_VALIDATION'] and ((global_step) % cfg['TRAIN']['FID_VALIDATION_STEPS'] == 0 or global_step == max_train_steps):
-                                val_prompts = []
-                                for val_batch in val_dataloader:
-                                    val_prompts.append(val_batch['prompts'])
+                            if cfg['EXPERIMENT']['FID_VALIDATION'] and ((global_step) % cfg['TRAIN']['FID_VALIDATION_STEPS'] == 0 or global_step + 1 == max_train_steps):
                                 fake_images = []
-                                val_progress = tqdm(total=len(val_prompts), disable=not accelerator.is_local_main_process)
-                                with accelerator.split_between_processes(val_prompts, apply_padding=True) as prompts_batches:
-                                    for batch in prompts_batches:
-                                        prompts_images = pipeline(batch, num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'], height=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], width=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], generator=generator).images
-                                        for image in prompts_images:
-                                            fake_images.append(image)
-                                        val_progress.update(1)
-                                accelerator.wait_for_everyone()
-                                fake_images = gather_object(fake_images)
+                                for val_batch in tqdm(val_dataloader):
+                                    fake_images += pipeline(val_batch['prompts'], num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'], height=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], width=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], generator=generator).images
 
-                                del pipeline               
+                                del pipeline 
 
                                 real_images = torch.stack(val_dataset.images)
 
@@ -304,6 +300,18 @@ def main():
                                 fake_feats = fid_metric.compute_feats(fake_loader, device=accelerator.device)
                                 
                                 fid_value = fid_metric(real_feats, fake_feats).item()
+
+                                #-----------------------------------------------------------
+                                fake_images = fake_dataset.data.to(accelerator.device)
+                                real_images = real_images.to(accelerator.device)
+                                torchmetrics_fid = FrechetInceptionDistance(normalize=True)
+                                torchmetrics_fid.to(accelerator.device)
+                                torchmetrics_fid.update(real_images, real=True)
+                                torchmetrics_fid.update(fake_images, real=False)
+
+                                log_dict['Torchmetrics_FID'] = float(torchmetrics_fid.compute())
+                                del torchmetrics_fid
+                                #-----------------------------------------------------------
 
                                 log_dict['FID'] = fid_value
                                 log_dict['SSIM'] = ssim_value

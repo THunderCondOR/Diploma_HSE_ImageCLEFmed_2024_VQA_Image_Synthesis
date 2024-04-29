@@ -5,3 +5,5 @@ src/wandb/
 __pycache__
 experiments/
 trained_lora_weights/
+src/original_medfusion/trained_models/*
+medfusion/

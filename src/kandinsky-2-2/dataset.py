@@ -217,6 +217,68 @@ class ClefKandinskyDecoderDataset(Dataset):
             return {"prompts": self.texts[item]}
 
 
+class AIROGSKandinskyDecoderDataset(Dataset):
+    def __init__(self,
+                 path,
+                 image_processor,
+                 csv_filename='train_labels.csv',
+                 resolution=256,
+                 train=True,
+                 load_to_ram=False,
+                 random_seed=2204):
+        super().__init__()
+        
+        self.random_state = np.random.RandomState(random_seed)
+        self.path = path
+        self.resolution = resolution
+        self.load_to_ram = load_to_ram
+        self.image_processor = image_processor
+        self.train = train
+        
+        self.prompts_info = pd.read_csv(self.path + f'/{csv_filename}', header=0)
+
+        self.image_files = self.prompts_info['challenge_id'].unique()
+        
+        if not train:
+            clef_info = pd.read_csv('/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/data/image_clef/train/prompt-gt.csv', header=0, delimiter=';')
+            clef_info['original_index'] = clef_info.index
+            val_indexes = clef_info.groupby('Filename').apply(lambda x: x.sample(1, random_state=self.random_state)).sample(2000)['original_index'].to_numpy()
+            self.texts = clef_info.iloc[val_indexes, 0].tolist()
+            self.image_ids, self.image_files = pd.factorize(clef_info.iloc[val_indexes, 1])
+        
+        if load_to_ram:
+            self.images = self._load_images(self.image_files)
+        
+
+    def _load_images(self, image_files):
+        images = []
+        for filename in image_files:
+            image = Image.open(f'/home/mvchaychuk/Diploma_HSE_ImageCLEFmed_2024_VQA_Image_Synthesis/data/image_clef/train/images/{filename}').convert('RGB')
+            transform = T.Compose([T.CenterCrop(min(image.size)),
+                                   T.Resize(self.resolution),
+                                   T.ToTensor(),
+                                   ])
+            images += [transform(image)]
+
+        return images
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, item):
+        if self.train:
+            filename = self.image_files[item]
+            image = Image.open(f'{self.path}/images/{filename}.jpg').convert('RGB')
+            transform = T.Compose([T.RandomCrop(min(image.size)),
+                                    T.Resize(self.resolution),
+                                    T.ToTensor(),
+                                    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+        
+            return {"pixel_values": transform(image).to(torch.float32),
+                    "clip_pixel_values":  self.image_processor(image, return_tensors="pt").pixel_values.squeeze(0)}
+        else:
+            return {"prompts": self.texts[item]}
+
 class MyFIDDataset(Dataset):
     def __init__(self, data, fake=False):
         super().__init__()
